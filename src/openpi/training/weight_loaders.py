@@ -49,9 +49,17 @@ class CheckpointWeightLoader(WeightLoader):
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
-        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        loaded_params = _model.restore_params(
+            download.maybe_download(self.params_path), restore_type=np.ndarray
+        )
+        # Merge missing parameters. In addition to LoRA weights, newer models may introduce a
+        # `qformer` sub-module that will not be present in older checkpoints. These parameters
+        # should fall back to their default initialization rather than causing a structure
+        # mismatch error. We therefore extend the missing-parameter regex to also include the
+        # qformer subtree.
+        return _merge_params(
+            loaded_params, params, missing_regex=".*(?:lora|qformer).*"
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,16 +72,23 @@ class PaliGemmaWeightLoader(WeightLoader):
 
     def load(self, params: at.Params) -> at.Params:
         path = download.maybe_download(
-            "gs://vertex-model-garden-paligemma-us/paligemma/pt_224.npz", gs={"token": "anon"}
+            "gs://vertex-model-garden-paligemma-us/paligemma/pt_224.npz",
+            gs={"token": "anon"},
         )
         with path.open("rb") as f:
             flat_params = dict(np.load(f, allow_pickle=False))
-        loaded_params = {"PaliGemma": flax.traverse_util.unflatten_dict(flat_params, sep="/")["params"]}
+        loaded_params = {
+            "PaliGemma": flax.traverse_util.unflatten_dict(flat_params, sep="/")[
+                "params"
+            ]
+        }
         # Add all missing weights.
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 
-def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
+def _merge_params(
+    loaded_params: at.Params, params: at.Params, *, missing_regex: str
+) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 
     Args:

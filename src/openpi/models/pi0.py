@@ -13,6 +13,7 @@ import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
+from openpi.models.openpi_memory import OpenPIMemory
 
 logger = logging.getLogger("openpi")
 
@@ -47,7 +48,10 @@ def make_attn_mask(input_mask, mask_ar):
 
 @at.typecheck
 def posemb_sincos(
-    pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
+    pos: at.Real[at.Array, " b"],
+    embedding_dim: int,
+    min_period: float,
+    max_period: float,
 ) -> at.Float[at.Array, "b {embedding_dim}"]:
     """Computes sine-cosine positional embedding vectors for scalar positions."""
     if embedding_dim % 2 != 0:
@@ -67,13 +71,20 @@ def posemb_sincos(
 @dataclasses.dataclass(frozen=True)
 class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
-    paligemma_variant: _gemma.Variant = "gemma_2b"
-    action_expert_variant: _gemma.Variant = "gemma_300m"
+    # Use LoRA variants by default so that fine-tuning only updates lightweight
+    # adapter parameters instead of the full backbone (lower GPU memory).
+    paligemma_variant: _gemma.Variant = "gemma_2b_lora"
+    action_expert_variant: _gemma.Variant = "gemma_300m_lora"
 
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50
     max_token_len: int = 48
+
+    use_memory: bool = True  # 启用，仅使用短期记忆
+    short_memory_length: int = 2  # 短期记忆窗口 = 18
+    long_memory_length: int = 4
+    short_memory_merge: int = 2
 
     @property
     @override
@@ -85,8 +96,12 @@ class Pi0Config(_model.BaseModelConfig):
         return Pi0(self, rngs=nnx.Rngs(rng))
 
     @override
-    def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
-        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+    def inputs_spec(
+        self, *, batch_size: int = 1
+    ) -> tuple[_model.Observation, _model.Actions]:
+        image_spec = jax.ShapeDtypeStruct(
+            [batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32
+        )
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():
@@ -102,49 +117,35 @@ class Pi0Config(_model.BaseModelConfig):
                     "right_wrist_0_rgb": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
-                tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
-                tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                tokenized_prompt=jax.ShapeDtypeStruct(
+                    [batch_size, self.max_token_len], jnp.int32
+                ),
+                tokenized_prompt_mask=jax.ShapeDtypeStruct(
+                    [batch_size, self.max_token_len], bool
+                ),
             )
-        action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
+        action_spec = jax.ShapeDtypeStruct(
+            [batch_size, self.action_horizon, self.action_dim], jnp.float32
+        )
 
         return observation_spec, action_spec
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
         """Returns the freeze filter based on the model config."""
-        filters = []
-        has_lora = False
-        gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
-        action_expert_params_filter = nnx_utils.PathRegex(".*llm.*_1.*")
-        if "lora" in self.paligemma_variant:
-            filters.append(
-                gemma_params_filter,
-            )
-            if "lora" not in self.action_expert_variant:
-                # If only freeze gemma params, exclude action expert params.
-                filters.append(
-                    nnx.Not(action_expert_params_filter),
-                )
-            has_lora = True
-        elif "lora" in self.action_expert_variant:
-            filters.append(
-                action_expert_params_filter,
-            )
-            has_lora = True
-
-        if has_lora:
-            # If any lora is used, exclude all lora params.
-            filters.append(
-                nnx.Not(nnx_utils.PathRegex(".*lora.*")),
-            )
-        if not filters:
-            return nnx.Nothing
-        return nnx.All(*filters)
+        # Freeze all LLM backbone parameters but keep LoRA adapters trainable.
+        # This simple rule works because both backbone sub-models (paligemma & action_expert)
+        # live under paths that match ".*llm.*" and LoRA weights include "lora" in their path.
+        return nnx.All(
+            nnx_utils.PathRegex(".*llm.*"),
+            nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+        )
 
 
 class Pi0(_model.BaseModel):
     def __init__(self, config: Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
+        self.config = config
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
         llm = nnx_bridge.ToNNX(
@@ -163,36 +164,86 @@ class Pi0(_model.BaseModel):
                 dtype_mm=config.dtype,
             )
         )
-        img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
+        img.lazy_init(
+            next(iter(config.fake_obs().images.values())), train=False, rngs=rngs
+        )
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
-        self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
-        self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
-        self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
-        self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-        self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        self.state_proj = nnx.Linear(
+            config.action_dim, action_expert_config.width, rngs=rngs
+        )
+        self.action_in_proj = nnx.Linear(
+            config.action_dim, action_expert_config.width, rngs=rngs
+        )
+        self.action_time_mlp_in = nnx.Linear(
+            2 * action_expert_config.width, action_expert_config.width, rngs=rngs
+        )
+        self.action_time_mlp_out = nnx.Linear(
+            action_expert_config.width, action_expert_config.width, rngs=rngs
+        )
+        self.action_out_proj = nnx.Linear(
+            action_expert_config.width, config.action_dim, rngs=rngs
+        )
+        # ---------------------------------------------------------------
+        # Q-Former removed: we now store raw patch tokens (4 per image) directly
+        # 集成 openpiMemory
+        if hasattr(config, "use_memory") and config.use_memory:
+            self.memory = OpenPIMemory(
+                short_len=config.short_memory_length,
+                long_len=config.long_memory_length,
+                merge_len=config.short_memory_merge,
+                state_len=config.long_memory_length,
+            )
+            self.use_memory = True
+        else:
+            self.memory = None
+            self.use_memory = False
 
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+    ) -> tuple[
+        at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]
+    ]:
         input_mask = []
         ar_mask = []
         tokens = []
         # embed images
+        image_tokens_list = []
+        image_mask_list = []
+        ar_mask_list = []
         for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
-
-            tokens.append(image_tokens)
-            input_mask.append(
+            img_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            image_tokens_list.append(img_tokens)
+            image_mask_list.append(
                 einops.repeat(
                     obs.image_masks[name],
                     "b -> b s",
-                    s=image_tokens.shape[1],
+                    s=img_tokens.shape[1],
                 )
             )
-            # image tokens attend to each other
-            ar_mask += [False] * image_tokens.shape[1]
-
+            ar_mask_list += [False] * img_tokens.shape[1]
+        if image_tokens_list:
+            image_tokens = jnp.concatenate(image_tokens_list, axis=1)  # [b, s_img, emb]
+            image_mask = jnp.concatenate(image_mask_list, axis=1)      # [b, s_img]
+            ar_mask_img = ar_mask_list                                 # [s_img]
+            # 如果启用 memory，则拼接 short/long memory 的视觉特征
+            if self.use_memory and self.memory is not None:
+                # memory.get_concat_image_features 返回 [b, s_mem, emb]
+                mem_tokens = self.memory.get_concat_image_features(jnp.zeros_like(image_tokens))
+                # mem_tokens 只包含 memory，不包含当前 image tokens
+                tokens.append(mem_tokens)
+                tokens.append(image_tokens)
+                # mask
+                mem_mask = jnp.ones((mem_tokens.shape[0], mem_tokens.shape[1]), dtype=jnp.bool_)
+                input_mask.append(mem_mask)
+                input_mask.append(image_mask)
+                # ar_mask
+                ar_mask += [False] * mem_tokens.shape[1]
+                ar_mask += ar_mask_img
+            else:
+                tokens.append(image_tokens)
+                input_mask.append(image_mask)
+                ar_mask += ar_mask_img
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
@@ -207,20 +258,28 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"],
+    ) -> tuple[
+        at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]
+    ]:
         input_mask = []
         ar_mask = []
         tokens = []
-        # add a single state token
-        state_token = self.state_proj(obs.state)[:, None, :]
+
+        # Only use *current* robot state as a single token (no memory).
+        state_token = self.state_proj(obs.state)[:, None, :]  # (B,1,emb)
         tokens.append(state_token)
         input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
         # image/language inputs do not attend to state or actions
         ar_mask += [True]
 
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
-        time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        time_emb = posemb_sincos(
+            timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0
+        )
         # mix timestep + action information using an MLP
         action_tokens = self.action_in_proj(noisy_actions)
         time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
@@ -239,10 +298,18 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        collect_attn: bool = False,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train
+        )
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -253,15 +320,48 @@ class Pi0(_model.BaseModel):
 
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time)
+        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(
+            observation, x_t, time
+        )
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
+        # Attention-score logging disabled -----------------------------
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions
+            [prefix_tokens, suffix_tokens],
+            mask=attn_mask,
+            positions=positions,
+            # collect_attn = collect_attn,
+            # mutable      = ['stats'] if collect_attn else False,
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+        metrics = {}
+        # Attention-score metrics disabled -----------------------------
+        # if collect_attn and self.use_memory:
+        #     long_len   = len(self.memory.long_image_memory)  * 12
+        #     short_len  = len(self.memory.short_image_memory) * 12
+        #     curr_len   = 12                                  # 3 cam × 4 patch
+        #     long_idx   = jnp.arange(0, long_len)
+        #     short_idx  = jnp.arange(long_len, long_len+short_len)
+        #     curr_idx   = jnp.arange(long_len+short_len, long_len+short_len+curr_len)
+        #
+        #     def slice_mean(p, idx):
+        #         return p.mean(axis=(1,2,3))[..., idx].mean()
+        #
+        #     attn_list = mut['stats']['attn_probs']
+        #     short_score = jnp.mean(jnp.stack([slice_mean(p, short_idx) for p in attn_list]))
+        #     long_score  = jnp.mean(jnp.stack([slice_mean(p, long_idx ) for p in attn_list]))
+        #     curr_score  = jnp.mean(jnp.stack([slice_mean(p, curr_idx) for p in attn_list]))
+        #     metrics.update(short_mem=short_score,
+        #                    long_mem =long_score,
+        #                    curr_vis =curr_score)
+        #
+        # # if collect_attn and jax.process_index()==0:
+        # #     with open(ATTN_LOG, "a") as f:
+        # #         f.write(f"{step}\t{metrics['curr_vis']:.6f}\t"
+        # #                 f"{metrics['short_mem']:.6f}\t{metrics['long_mem']:.6f}\n")
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
@@ -278,13 +378,17 @@ class Pi0(_model.BaseModel):
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
-        noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+        noise = jax.random.normal(
+            rng, (batch_size, self.action_horizon, self.action_dim)
+        )
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        _, kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
 
         def step(carry):
             x_t, time = carry
@@ -296,20 +400,31 @@ class Pi0(_model.BaseModel):
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
             # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
             # prefix tokens
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            prefix_attn_mask = einops.repeat(
+                prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1]
+            )
             # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
             # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            full_attn_mask = jnp.concatenate(
+                [prefix_attn_mask, suffix_attn_mask], axis=-1
+            )
             assert full_attn_mask.shape == (
                 batch_size,
                 suffix_tokens.shape[1],
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            positions = (
+                jnp.sum(prefix_mask, axis=-1)[:, None]
+                + jnp.cumsum(suffix_mask, axis=-1)
+                - 1
+            )
 
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                [None, suffix_tokens], mask=full_attn_mask, positions=positions, kv_cache=kv_cache
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
             )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
@@ -323,3 +438,102 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+        # 在每步推理后，更新 memory
+        if self.use_memory:
+            image_tokens_list = []
+            for name in observation.images:
+                img_tokens, _ = self.PaliGemma.img(
+                    observation.images[name], train=False
+                )
+                # Directly use raw patch tokens (4 per image) for memory
+                image_tokens_list.append(img_tokens)
+            if image_tokens_list:
+                all_image_tokens = jnp.concatenate(image_tokens_list, axis=1)
+                self.memory.update_image_memory(all_image_tokens)
+
+        return x_0
+
+    # ------------------------------------------------------------------
+    # Forward (predict noise)
+    # ------------------------------------------------------------------
+    @at.typecheck
+    def __call__(
+        self,
+        observation: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"],
+        *,
+        train: bool = False,
+    ) -> at.Float[at.Array, "*b ah ad"]:
+        """Forward pass used for diffusion loss.
+
+        Args:
+            observation: Pre-processed observation batch.
+            noisy_actions: The noised action sequence (same shape as target actions).
+            timestep: Diffusion timestep in \[0,1\] for each batch element.
+            train: Whether in training mode (passed to dropout etc.).
+
+        Returns:
+            Predicted noise with same shape as *actions* (B, action_horizon, action_dim).
+        """
+
+        # 1. Prefix pass (images, prompt, etc.) ---------------------------------
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1  # (b, p_len)
+
+        # Feed only to first expert (PaliGemma); second expert gets None
+        _, kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=prefix_attn_mask,
+            positions=prefix_positions,
+            deterministic=not train,
+        )
+
+        # 2. Suffix pass (state, actions, timestep) -----------------------------
+        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(
+            observation, noisy_actions, timestep
+        )
+
+        # how suffix tokens attend among themselves
+        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+        # how suffix tokens attend to prefix tokens (all allowed)
+        prefix_attn_mask_to_suffix = einops.repeat(
+            prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1]
+        )
+        full_attn_mask = jnp.concatenate(
+            [prefix_attn_mask_to_suffix, suffix_attn_mask], axis=-1
+        )  # shape (b, s_len, p_len + s_len)
+
+        # positions for suffix tokens start after prefix length
+        suffix_positions = (
+            jnp.sum(prefix_mask, axis=-1)[:, None]
+            + jnp.cumsum(suffix_mask, axis=-1)
+            - 1
+        )
+
+        (_, suffix_out), _ = self.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=full_attn_mask,
+            positions=suffix_positions,
+            kv_cache=kv_cache,
+            deterministic=not train,
+        )
+
+        # We only care about the last action_horizon tokens (they correspond to actions)
+        predicted_noise = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+        return predicted_noise
+
+    def init(self):
+        """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
+        self.embed(jnp.zeros((1, 1), dtype=jnp.int32))
+        self(
+            [jnp.zeros((1, 1, c.width)) for c in self.configs],           # embedded
+            jnp.zeros((1, len(self.configs)), dtype=jnp.int32),           # positions
+            jnp.zeros((1, len(self.configs), len(self.configs)), dtype=bool),  # mask
+            kv_cache=None,
+            deterministic=True,
+            # collect_attn=False,  # attention logging disabled
+        )

@@ -30,6 +30,7 @@ class Policy(BasePolicy):
         sample_kwargs: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ):
+        self._model = model
         self._sample_actions = nnx_utils.module_jit(model.sample_actions)
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
@@ -48,7 +49,9 @@ class Policy(BasePolicy):
         self._rng, sample_rng = jax.random.split(self._rng)
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng, _model.Observation.from_dict(inputs), **self._sample_kwargs),
+            "actions": self._sample_actions(
+                sample_rng, _model.Observation.from_dict(inputs), **self._sample_kwargs
+            ),
         }
 
         # Unbatch and convert to np.ndarray.
@@ -58,6 +61,22 @@ class Policy(BasePolicy):
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
+
+    def reset(self) -> None:  # noqa: D401
+        """Reset episodic states.
+
+        The runtime (`openpi_client.runtime.Runtime`) calls `agent.reset()` at the beginning
+        of every episode, which is forwarded to `policy.reset()`.  Here we clear the model
+        memory (if it exists) so that cross-episode information does not leak.
+        """
+
+        # Reset RNG so that each episode starts with a new random seed split.
+        # This is optional, but keeps behavior deterministic between episodes.
+        self._rng, _ = jax.random.split(self._rng)
+
+        # Clear model memory if the model uses the OpenPIMemory mechanism.
+        if hasattr(self._model, "memory") and self._model.memory is not None:
+            self._model.memory.reset()
 
 
 class PolicyRecorder(_base_policy.BasePolicy):
