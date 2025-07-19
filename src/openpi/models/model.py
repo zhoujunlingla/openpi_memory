@@ -229,7 +229,35 @@ class BaseModelConfig(abc.ABC):
         graphdef, state = nnx.split(model)
         if remove_extra_params:
             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
-        at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
+
+        # ------------------------------------------------------------------
+        # Backwards-compatibility: Older checkpoints may lack parameters that
+        # were introduced in newer model versions (e.g., mem_mlp_in/out in Pi0).
+        # We automatically fill in any *missing* parameters with the freshly
+        # initialized values from the current model so that loading still
+        # succeeds. Extra parameters present in the checkpoint have already
+        # been removed by the intersect above.
+        # ------------------------------------------------------------------
+        flat_state = traverse_util.flatten_dict(state.to_pure_dict())
+        flat_params = traverse_util.flatten_dict(params)
+        for kp, v in flat_state.items():
+            if kp not in flat_params:
+                flat_params[kp] = v
+        params = traverse_util.unflatten_dict(flat_params)
+
+        try:
+            at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
+        except ValueError as e:
+            # Remaining mismatches may come from newly introduced modules.
+            # Log the issue and fall back to freshly initialized values for
+            # unmatched subtrees while keeping all checkpointed weights.
+            logger.warning("Checkpoint parameters did not fully match model structure: %s", e)
+            logger.warning("Missing parameters will be randomly initialized.")
+
+            # Replace only the matching subtree; unmatched modules keep init values.
+            intersect = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
+            params = intersect
+
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
 

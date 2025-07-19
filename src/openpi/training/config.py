@@ -661,7 +661,7 @@ _CONFIGS = [
         name="pi0_piper",
         model=pi0.Pi0Config(action_horizon=50, max_token_len=180),
         data=LeRobotPiperDataConfig(
-            repo_id="csuvla/multi_task",
+            repo_id="csuvla/task1-16",
             repack_transforms=_transforms.Group(
                 inputs=[
                     _transforms.RepackTransform(

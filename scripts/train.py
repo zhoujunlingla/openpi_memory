@@ -72,11 +72,26 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
+
+    # ------------------------------------------------------------------
+    # Pad missing parameters (e.g., newly added layers) with the placeholder
+    # `jax.ShapeDtypeStruct` values from `params_shape` so that tree equality
+    # checks succeed even when the checkpoint lacks these parameters. They
+    # will be filtered out afterwards, leaving them randomly initialized.
+    # ------------------------------------------------------------------
+    flat_shape = traverse_util.flatten_dict(params_shape)
+    flat_loaded = traverse_util.flatten_dict(loaded_params)
+    for kp, placeholder in flat_shape.items():
+        if kp not in flat_loaded:
+            flat_loaded[kp] = placeholder
+    loaded_params = traverse_util.unflatten_dict(flat_loaded)
+
     at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
 
-    # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
+    # Remove jax.ShapeDtypeStruct placeholders so that only real checkpoint
+    # weights are merged into the model (missing ones stay randomly init).
     return traverse_util.unflatten_dict(
-        {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
+        {k: v for k, v in flat_loaded.items() if not isinstance(v, jax.ShapeDtypeStruct)}
     )
 
 

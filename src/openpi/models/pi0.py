@@ -7,13 +7,14 @@ import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
 from typing_extensions import override
-
+from collections.abc import Sequence, Mapping
 from openpi.models import model as _model
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 from openpi.models.openpi_memory import OpenPIMemory
+# Q-Former replaced by an MLP summarizer; import no longer required.
 
 logger = logging.getLogger("openpi")
 
@@ -81,10 +82,13 @@ class Pi0Config(_model.BaseModelConfig):
     action_horizon: int = 50
     max_token_len: int = 48
 
-    use_memory: bool = True  # 启用，仅使用短期记忆
-    short_memory_length: int = 2  # 短期记忆窗口 = 18
-    long_memory_length: int = 4
-    short_memory_merge: int = 2
+    # 只保留长期记忆参数
+    long_memory_length: int = 256
+    merge_length: int = 18  # 新增merge_length参数用于长期记忆合并
+    # 注释短期记忆相关参数
+    # use_memory: bool = True
+    # short_memory_length: int = 18
+    # short_memory_merge: int = 2
 
     @property
     @override
@@ -168,6 +172,18 @@ class Pi0(_model.BaseModel):
             next(iter(config.fake_obs().images.values())), train=False, rngs=rngs
         )
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
+
+        # ------------------------------------------------------------------
+        # MLP summarizer to map variable-length memory tokens into a fixed
+        # number (32) of visual tokens. This replaces the previous Q-Former.
+        # ------------------------------------------------------------------
+        self.num_memory_tokens = 32
+        self.mem_mlp_in = nnx.Linear(
+            paligemma_config.width, paligemma_config.width, rngs=rngs
+        )
+        self.mem_mlp_out = nnx.Linear(
+            paligemma_config.width, paligemma_config.width, rngs=rngs
+        )
         self.state_proj = nnx.Linear(
             config.action_dim, action_expert_config.width, rngs=rngs
         )
@@ -184,19 +200,25 @@ class Pi0(_model.BaseModel):
             action_expert_config.width, config.action_dim, rngs=rngs
         )
         # ---------------------------------------------------------------
-        # Q-Former removed: we now store raw patch tokens (4 per image) directly
-        # 集成 openpiMemory
-        if hasattr(config, "use_memory") and config.use_memory:
-            self.memory = OpenPIMemory(
-                short_len=config.short_memory_length,
-                long_len=config.long_memory_length,
-                merge_len=config.short_memory_merge,
-                state_len=config.long_memory_length,
-            )
-            self.use_memory = True
-        else:
-            self.memory = None
-            self.use_memory = False
+        # 只保留长期记忆
+        self.memory = OpenPIMemory(
+            long_len=config.long_memory_length,
+            merge_len=config.merge_length,
+            state_len=config.long_memory_length,
+        )
+        self.use_memory = True
+        # 注释短期记忆相关初始化
+        # if hasattr(config, "use_memory") and config.use_memory:
+        #     self.memory = OpenPIMemory(
+        #         short_len=config.short_memory_length,
+        #         long_len=config.long_memory_length,
+        #         merge_len=config.short_memory_merge,
+        #         state_len=config.long_memory_length,
+        #     )
+        #     self.use_memory = True
+        # else:
+        #     self.memory = None
+        #     self.use_memory = False
 
     @at.typecheck
     def embed_prefix(
@@ -226,19 +248,39 @@ class Pi0(_model.BaseModel):
             image_tokens = jnp.concatenate(image_tokens_list, axis=1)  # [b, s_img, emb]
             image_mask = jnp.concatenate(image_mask_list, axis=1)      # [b, s_img]
             ar_mask_img = ar_mask_list                                 # [s_img]
-            # 如果启用 memory，则拼接 short/long memory 的视觉特征
+            # 只拼接长期记忆的视觉特征
             if self.use_memory and self.memory is not None:
-                # memory.get_concat_image_features 返回 [b, s_mem, emb]
-                mem_tokens = self.memory.get_concat_image_features(jnp.zeros_like(image_tokens))
-                # mem_tokens 只包含 memory，不包含当前 image tokens
-                tokens.append(mem_tokens)
+                mem_tokens = self.memory.long_image_memory
+                if len(mem_tokens) > 0:
+                    mem_tokens = jnp.stack(mem_tokens, axis=0)  # (N, D)
+                    mem_tokens = jnp.broadcast_to(mem_tokens[None, ...], (image_tokens.shape[0],) + mem_tokens.shape)
+                    mlp_out = self.mem_mlp_out(
+                        nnx.swish(self.mem_mlp_in(mem_tokens))
+                    )  # (B, N, D)
+                    n = mlp_out.shape[1]
+                    if n >= self.num_memory_tokens:
+                        q_tokens = mlp_out[:, :self.num_memory_tokens, :]
+                    else:
+                        pad_len = self.num_memory_tokens - n
+                        pad = jnp.zeros((mlp_out.shape[0], pad_len, mlp_out.shape[2]), dtype=mlp_out.dtype)
+                        q_tokens = jnp.concatenate([mlp_out, pad], axis=1)
+                else:
+                    q_tokens = jnp.zeros(
+                        (
+                            image_tokens.shape[0],
+                            self.num_memory_tokens,
+                            image_tokens.shape[2],
+                        ),
+                        dtype=image_tokens.dtype,
+                    )
+                tokens.append(q_tokens)
                 tokens.append(image_tokens)
-                # mask
-                mem_mask = jnp.ones((mem_tokens.shape[0], mem_tokens.shape[1]), dtype=jnp.bool_)
-                input_mask.append(mem_mask)
+                # masks
+                q_mask = jnp.ones((q_tokens.shape[0], q_tokens.shape[1]), dtype=jnp.bool_)
+                input_mask.append(q_mask)
                 input_mask.append(image_mask)
-                # ar_mask
-                ar_mask += [False] * mem_tokens.shape[1]
+                # ar_mask: treat summary tokens like previous memory (non-auto-regressive)
+                ar_mask += [False] * q_tokens.shape[1]
                 ar_mask += ar_mask_img
             else:
                 tokens.append(image_tokens)
@@ -327,43 +369,96 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
-        # Attention-score logging disabled -----------------------------
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens],
-            mask=attn_mask,
-            positions=positions,
-            # collect_attn = collect_attn,
-            # mutable      = ['stats'] if collect_attn else False,
-        )
+        # ------------------------------------------------------------------
+        # Forward pass through the language model. When *collect_attn* is
+        # true we also request the mutable "stats" collection so that we can
+        # compute attention-based metrics between current visual tokens and
+        # the short-/long-term memory tokens.
+        # ------------------------------------------------------------------
+        # Call LLM and gracefully handle whether stats are returned.
+        if collect_attn:
+            ret = self.PaliGemma.llm(
+                [prefix_tokens, suffix_tokens],
+                mask=attn_mask,
+                positions=positions,
+                mutable=["stats"],  # may be ignored by implementation
+            )
+        else:
+            ret = self.PaliGemma.llm(
+                [prefix_tokens, suffix_tokens],
+                mask=attn_mask,
+                positions=positions,
+            )
+
+        # Unpack variable-length return (common patterns: ((out1,out2), kv_cache) or ((out1,out2), kv_cache, mut))
+        if not (isinstance(ret, tuple) and len(ret) >= 1):
+            raise ValueError("Unexpected return signature from PaliGemma.llm")
+
+        (prefix_out, suffix_out) = ret[0]
+
+        # Heuristically identify kv_cache and mut.  The last element often
+        # contains mutable collections if it is a Mapping with "stats" key.
+        kv_cache = None
+        mut = None
+        for elem in ret[1:]:
+            if mut is None and isinstance(elem, dict | Mapping):
+                # Potential mutable collection
+                mut = elem
+            elif kv_cache is None:
+                kv_cache = elem
+
+        # `kv_cache` can still be None during training (not used here).
+
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        metrics = {}
-        # Attention-score metrics disabled -----------------------------
-        # if collect_attn and self.use_memory:
-        #     long_len   = len(self.memory.long_image_memory)  * 12
-        #     short_len  = len(self.memory.short_image_memory) * 12
-        #     curr_len   = 12                                  # 3 cam × 4 patch
-        #     long_idx   = jnp.arange(0, long_len)
-        #     short_idx  = jnp.arange(long_len, long_len+short_len)
-        #     curr_idx   = jnp.arange(long_len+short_len, long_len+short_len+curr_len)
-        #
-        #     def slice_mean(p, idx):
-        #         return p.mean(axis=(1,2,3))[..., idx].mean()
-        #
-        #     attn_list = mut['stats']['attn_probs']
-        #     short_score = jnp.mean(jnp.stack([slice_mean(p, short_idx) for p in attn_list]))
-        #     long_score  = jnp.mean(jnp.stack([slice_mean(p, long_idx ) for p in attn_list]))
-        #     curr_score  = jnp.mean(jnp.stack([slice_mean(p, curr_idx) for p in attn_list]))
-        #     metrics.update(short_mem=short_score,
-        #                    long_mem =long_score,
-        #                    curr_vis =curr_score)
-        #
-        # # if collect_attn and jax.process_index()==0:
-        # #     with open(ATTN_LOG, "a") as f:
-        # #         f.write(f"{step}\t{metrics['curr_vis']:.6f}\t"
-        # #                 f"{metrics['short_mem']:.6f}\t{metrics['long_mem']:.6f}\n")
+        # ------------------------------------------------------------------
+        # Compute attention-based metrics when requested. We now *merge* short
+        # and long memory into a single "memory" category as per user request.
+        # The returned metric vector has length 2: [curr_vis, memory].
+        # ------------------------------------------------------------------
+        if collect_attn and self.use_memory and (
+            mut is not None and isinstance(mut, Mapping) and "stats" in mut and "attn_probs" in mut["stats"]
+        ):
+            mem_len = len(self.memory.long_image_memory) * 12  # 只用long memory
+            curr_len = 12  
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+            mem_idx = jnp.arange(0, mem_len)
+            curr_idx = jnp.arange(mem_len, mem_len + curr_len)
+
+            def slice_mean(p, idx):
+                # p shape: (B, K, G, T, S)
+                return p.mean(axis=(1, 2, 3))[..., idx].mean()
+
+            attn_list = mut["stats"]["attn_probs"]
+
+            if isinstance(attn_list, list):
+                memory_score = jnp.mean(jnp.stack([slice_mean(p, mem_idx) for p in attn_list]))
+                curr_score = jnp.mean(jnp.stack([slice_mean(p, curr_idx) for p in attn_list]))
+            else:
+                memory_score = slice_mean(attn_list, mem_idx)
+                curr_score = slice_mean(attn_list, curr_idx)
+
+            metrics = jnp.stack([curr_score, memory_score])
+        else:
+            metrics = jnp.zeros(2, dtype=jnp.float32)
+
+        loss_vals = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+
+        # ------------------------------------------------------------------
+        # Update visual memory during training so that short/long memories are
+        # non-empty and attention metrics become meaningful.
+        # ------------------------------------------------------------------
+        if self.use_memory and train:
+            image_tokens_list = []
+            for name in observation.images:
+                img_tokens, _ = self.PaliGemma.img(observation.images[name], train=False)
+                image_tokens_list.append(img_tokens)
+            if image_tokens_list:
+                # Store memory per sample (take first batch element to avoid B mismatch)
+                sample_tokens = jnp.concatenate(image_tokens_list, axis=1)[0]  # shape (s_img_total, D)
+                self.memory.update_image_memory(sample_tokens)
+
+        return (loss_vals, metrics) if collect_attn else loss_vals
 
     @override
     def sample_actions(
