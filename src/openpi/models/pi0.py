@@ -74,8 +74,8 @@ class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     # Use LoRA variants by default so that fine-tuning only updates lightweight
     # adapter parameters instead of the full backbone (lower GPU memory).
-    paligemma_variant: _gemma.Variant = "gemma_2b_lora"
-    action_expert_variant: _gemma.Variant = "gemma_300m_lora"
+    paligemma_variant: _gemma.Variant = "gemma_2b"
+    action_expert_variant: _gemma.Variant = "gemma_300m"
 
     # Set the model specific defaults.
     action_dim: int = 32
@@ -85,10 +85,6 @@ class Pi0Config(_model.BaseModelConfig):
     # 只保留长期记忆参数
     long_memory_length: int = 256
     merge_length: int = 18  # 新增merge_length参数用于长期记忆合并
-    # 注释短期记忆相关参数
-    # use_memory: bool = True
-    # short_memory_length: int = 18
-    # short_memory_merge: int = 2
 
     @property
     @override
@@ -136,13 +132,34 @@ class Pi0Config(_model.BaseModelConfig):
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
         """Returns the freeze filter based on the model config."""
-        # Freeze all LLM backbone parameters but keep LoRA adapters trainable.
-        # This simple rule works because both backbone sub-models (paligemma & action_expert)
-        # live under paths that match ".*llm.*" and LoRA weights include "lora" in their path.
-        return nnx.All(
-            nnx_utils.PathRegex(".*llm.*"),
-            nnx.Not(nnx_utils.PathRegex(".*lora.*")),
-        )
+        filters = []
+        has_lora = False
+        gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
+        action_expert_params_filter = nnx_utils.PathRegex(".*llm.*_1.*")
+        if "lora" in self.paligemma_variant:
+            filters.append(
+                gemma_params_filter,
+            )
+            if "lora" not in self.action_expert_variant:
+                # If only freeze gemma params, exclude action expert params.
+                filters.append(
+                    nnx.Not(action_expert_params_filter),
+                )
+            has_lora = True
+        elif "lora" in self.action_expert_variant:
+            filters.append(
+                action_expert_params_filter,
+            )
+            has_lora = True
+
+        if has_lora:
+            # If any lora is used, exclude all lora params.
+            filters.append(
+                nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+            )
+        if not filters:
+            return nnx.Nothing
+        return nnx.All(*filters)
 
 
 class Pi0(_model.BaseModel):
@@ -207,18 +224,6 @@ class Pi0(_model.BaseModel):
             state_len=config.long_memory_length,
         )
         self.use_memory = True
-        # 注释短期记忆相关初始化
-        # if hasattr(config, "use_memory") and config.use_memory:
-        #     self.memory = OpenPIMemory(
-        #         short_len=config.short_memory_length,
-        #         long_len=config.long_memory_length,
-        #         merge_len=config.short_memory_merge,
-        #         state_len=config.long_memory_length,
-        #     )
-        #     self.use_memory = True
-        # else:
-        #     self.memory = None
-        #     self.use_memory = False
 
     @at.typecheck
     def embed_prefix(
@@ -412,35 +417,10 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         # ------------------------------------------------------------------
-        # Compute attention-based metrics when requested. We now *merge* short
-        # and long memory into a single "memory" category as per user request.
-        # The returned metric vector has length 2: [curr_vis, memory].
+        # Compute loss: mean-squared error between predicted and target noise.
+        # Attention-based diagnostic metrics have been removed; this function
+        # now focuses purely on diffusion loss.
         # ------------------------------------------------------------------
-        if collect_attn and self.use_memory and (
-            mut is not None and isinstance(mut, Mapping) and "stats" in mut and "attn_probs" in mut["stats"]
-        ):
-            mem_len = len(self.memory.long_image_memory) * 12  # 只用long memory
-            curr_len = 12  
-
-            mem_idx = jnp.arange(0, mem_len)
-            curr_idx = jnp.arange(mem_len, mem_len + curr_len)
-
-            def slice_mean(p, idx):
-                # p shape: (B, K, G, T, S)
-                return p.mean(axis=(1, 2, 3))[..., idx].mean()
-
-            attn_list = mut["stats"]["attn_probs"]
-
-            if isinstance(attn_list, list):
-                memory_score = jnp.mean(jnp.stack([slice_mean(p, mem_idx) for p in attn_list]))
-                curr_score = jnp.mean(jnp.stack([slice_mean(p, curr_idx) for p in attn_list]))
-            else:
-                memory_score = slice_mean(attn_list, mem_idx)
-                curr_score = slice_mean(attn_list, curr_idx)
-
-            metrics = jnp.stack([curr_score, memory_score])
-        else:
-            metrics = jnp.zeros(2, dtype=jnp.float32)
 
         loss_vals = jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
@@ -458,7 +438,7 @@ class Pi0(_model.BaseModel):
                 sample_tokens = jnp.concatenate(image_tokens_list, axis=1)[0]  # shape (s_img_total, D)
                 self.memory.update_image_memory(sample_tokens)
 
-        return (loss_vals, metrics) if collect_attn else loss_vals
+        return loss_vals
 
     @override
     def sample_actions(
@@ -532,16 +512,14 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-        return x_0
 
-        # 在每步推理后，更新 memory
+        # 在推理完成后，更新长期视觉记忆，以便下一次推理使用。
         if self.use_memory:
             image_tokens_list = []
             for name in observation.images:
                 img_tokens, _ = self.PaliGemma.img(
                     observation.images[name], train=False
                 )
-                # Directly use raw patch tokens (4 per image) for memory
                 image_tokens_list.append(img_tokens)
             if image_tokens_list:
                 all_image_tokens = jnp.concatenate(image_tokens_list, axis=1)

@@ -7,8 +7,12 @@ class OpenPIMemory:
         self.long_image_memory: List[jnp.ndarray] = []
         self.long_len = long_len
         self.merge_len = merge_len
-        self.state_len = state_len  # record state memory capacity
-        self.state_memory: List[jnp.ndarray] = []  # 保留所有历史 state
+        # `state_len` is kept for backward compatibility but no longer used
+        # because we only keep the *current* state.
+        self.state_len = state_len
+        # Historical state memory is deprecated; we keep a placeholder to
+        # avoid attribute-errors but no longer append to it.
+        self._dummy_state_memory: List[jnp.ndarray] = []
 
     def update_image_memory(self, image_features: jnp.ndarray):
         # 直接存入long_image_memory
@@ -26,7 +30,7 @@ class OpenPIMemory:
         arithmetic mean. The process repeats until the desired length
         is reached or no further pairs can be merged.
         """
-        while len(self.long_image_memory) > self.long_len:
+        while len(self.long_image_memory) > self.merge_len:
             max_sim = None
             max_idx = None
             # Search for the most similar adjacent pair.
@@ -50,11 +54,12 @@ class OpenPIMemory:
                 break
 
     def update_state_memory(self, state: jnp.ndarray):
-        self.state_memory.append(state)
-        # Keep only the most recent `state_len` states if a limit is set (>0).
-        if self.state_len > 0:
-            while len(self.state_memory) > self.state_len:
-                self.state_memory.pop(0)
+        """Deprecated: kept for API compatibility.
+
+        State information is now treated as *per-frame* and is **not stored**
+        in long-term memory.  This method therefore performs no operation.
+        """
+        pass
 
     def get_concat_image_features(
         self, current_image_features: jnp.ndarray
@@ -66,15 +71,13 @@ class OpenPIMemory:
             return current_image_features
 
     def get_concat_states(self, current_state: jnp.ndarray) -> jnp.ndarray:
-        all_states = self.state_memory + [current_state]
-        if all_states:
-            return jnp.concatenate(all_states, axis=0)
-        else:
-            return current_state
+        """Return the current state only (history no longer stored)."""
+        return current_state
 
     def reset(self):
         self.long_image_memory.clear()
-        self.state_memory.clear()
+        # Only image memory needs resetting now.
+        self._dummy_state_memory.clear()
 
     # ---------------------------------------------------------------------
     # Equality & hashing helpers
