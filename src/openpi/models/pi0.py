@@ -192,15 +192,25 @@ class Pi0(_model.BaseModel):
 
         # ------------------------------------------------------------------
         # MLP summarizer to map variable-length memory tokens into a fixed
-        # number (32) of visual tokens. This replaces the previous Q-Former.
+        # number (32) of visual tokens. We implement a *token-dimension*
+        # MLP: (B, N, D) → (B, 32, D) by reshaping to (B·D, N) and applying
+        # two Linear layers that operate on the token axis (N).
         # ------------------------------------------------------------------
         self.num_memory_tokens = 32
-        self.mem_mlp_in = nnx.Linear(
-            paligemma_config.width, paligemma_config.width, rngs=rngs
-        )
-        self.mem_mlp_out = nnx.Linear(
-            paligemma_config.width, paligemma_config.width, rngs=rngs
-        )
+        # 最大保留帧数（合并后）= long_memory_length (默认 256)
+        self.max_frames = config.long_memory_length
+
+        # Token-wise feature projection (D 维)
+        self.mem_mlp_in = nnx.Linear(paligemma_config.width,
+                                     paligemma_config.width,
+                                     rngs=rngs)
+        self.mem_mlp_out = nnx.Linear(paligemma_config.width,
+                                      paligemma_config.width,
+                                      rngs=rngs)
+
+        # Token-dimension compression: (N → 4N → 32)
+        self.len_mlp_in = nnx.Linear(self.max_frames, self.max_frames * 4, rngs=rngs)
+        self.len_mlp_out = nnx.Linear(self.max_frames * 4, self.num_memory_tokens, rngs=rngs)
         self.state_proj = nnx.Linear(
             config.action_dim, action_expert_config.width, rngs=rngs
         )
@@ -257,18 +267,48 @@ class Pi0(_model.BaseModel):
             if self.use_memory and self.memory is not None:
                 mem_tokens = self.memory.long_image_memory
                 if len(mem_tokens) > 0:
-                    mem_tokens = jnp.stack(mem_tokens, axis=0)  # (N, D)
-                    mem_tokens = jnp.broadcast_to(mem_tokens[None, ...], (image_tokens.shape[0],) + mem_tokens.shape)
-                    mlp_out = self.mem_mlp_out(
-                        nnx.swish(self.mem_mlp_in(mem_tokens))
+                    # ------------------------------------------------------
+                    # 1) 将长期记忆堆叠 & 广播到 batch: (B, N, D)
+                    # ------------------------------------------------------
+                    mem_stack = jnp.stack(mem_tokens, axis=0)  # (N, D)
+                    mem_stack = jnp.broadcast_to(
+                        mem_stack[None, ...],
+                        (image_tokens.shape[0],) + mem_stack.shape,
                     )  # (B, N, D)
-                    n = mlp_out.shape[1]
-                    if n >= self.num_memory_tokens:
-                        q_tokens = mlp_out[:, :self.num_memory_tokens, :]
-                    else:
-                        pad_len = self.num_memory_tokens - n
-                        pad = jnp.zeros((mlp_out.shape[0], pad_len, mlp_out.shape[2]), dtype=mlp_out.dtype)
-                        q_tokens = jnp.concatenate([mlp_out, pad], axis=1)
+
+                    # ------------------------------------------------------
+                    # 2) pad / truncate 到固定帧数 self.max_frames
+                    # ------------------------------------------------------
+                    n_cur = mem_stack.shape[1]
+                    if n_cur < self.max_frames:
+                        pad_len = self.max_frames - n_cur
+                        pad = jnp.zeros(
+                            (mem_stack.shape[0], pad_len, mem_stack.shape[2]),
+                            dtype=mem_stack.dtype,
+                        )
+                        mem_stack = jnp.concatenate([mem_stack, pad], axis=1)
+                    elif n_cur > self.max_frames:
+                        mem_stack = mem_stack[:, : self.max_frames, :]
+
+                    # ------------------------------------------------------
+                    # 3) Feature‐wise MLP (先投影 D)
+                    # ------------------------------------------------------
+                    mem_stack = self.mem_mlp_out(
+                        nnx.swish(self.mem_mlp_in(mem_stack))
+                    )  # (B, N, D)
+
+                    # ------------------------------------------------------
+                    # 4) Token-dimension MLP: (B, N, D) → (B, 32, D)
+                    # ------------------------------------------------------
+                    # 转为 (B*D, N)
+                    b, n_tok, d_feat = mem_stack.shape
+                    mem_flat = mem_stack.transpose(0, 2, 1).reshape(-1, n_tok)  # (B*D, N)
+
+                    mem_flat = nnx.swish(self.len_mlp_in(mem_flat))             # (B*D, 4N)
+                    mem_flat = self.len_mlp_out(mem_flat)                       # (B*D, 32)
+
+                    mem_seq = mem_flat.reshape(b, d_feat, self.num_memory_tokens)
+                    q_tokens = mem_seq.transpose(0, 2, 1)                       # (B, 32, D)
                 else:
                     q_tokens = jnp.zeros(
                         (

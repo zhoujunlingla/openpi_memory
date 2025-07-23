@@ -466,7 +466,7 @@ class TrainConfig:
     # How often (in steps) to log training metrics.
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
-    save_interval: int = 10000
+    save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 10000
 
@@ -661,7 +661,7 @@ _CONFIGS = [
         name="pi0_piper",
         model=pi0.Pi0Config(action_horizon=50, max_token_len=180),
         data=LeRobotPiperDataConfig(
-            repo_id="csuvla/task1-16",
+            repo_id="csuvla/multi_task",
             repack_transforms=_transforms.Group(
                 inputs=[
                     _transforms.RepackTransform(
@@ -685,7 +685,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "s3://openpi-assets/checkpoints/pi0_base/params"
         ),
-        num_train_steps=30_000,
+        num_train_steps=60_000,
         batch_size=32,
     ),
     TrainConfig(
@@ -714,7 +714,7 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "s3://openpi-assets/checkpoints/pi0_base/params"
+            "/mnt/afs/intern/fangwenhan/zhoujunl/openpi/checkpoints/pi0_piper/task1-16/29999/params"
         ),
         num_train_steps=30_000,
         batch_size=32,
