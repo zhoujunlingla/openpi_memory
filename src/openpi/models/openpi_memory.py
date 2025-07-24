@@ -3,55 +3,90 @@ from typing import List
 
 
 class OpenPIMemory:
+    """Batch-aware长期视觉记忆。
+
+    每个 batch 样本拥有独立的历史帧列表，结构为
+
+        long_image_memory: List[List[jnp.ndarray]]
+
+    外层索引 = batch index，内层 list 存不同时间帧的视觉 token（shape 通常为
+    (s_img_total, D)）。合并逻辑沿用原来按相邻帧最大相似度合并的启发式。"""
+
     def __init__(self, long_len: int, merge_len: int, state_len: int):
-        self.long_image_memory: List[jnp.ndarray] = []
+        # long_image_memory[b] -> List[jnp.ndarray] (frames) for sample *b*
+        self.long_image_memory: List[List[jnp.ndarray]] = []
         self.long_len = long_len
         self.merge_len = merge_len
-        # `state_len` is kept for backward compatibility but no longer used
-        # because we only keep the *current* state.
+        # state 相关保持兼容但不再使用
         self.state_len = state_len
-        # Historical state memory is deprecated; we keep a placeholder to
-        # avoid attribute-errors but no longer append to it.
         self._dummy_state_memory: List[jnp.ndarray] = []
 
-    def update_image_memory(self, image_features: jnp.ndarray):
-        # 直接存入long_image_memory
-        self.long_image_memory.append(image_features)
-        # 合并 long memory，直到长度不超过 long_len
-        self._merge_long_memory()
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _ensure_batch(self, batch_idx: int):  # noqa: D401, ANN001
+        """确保 long_image_memory 至少能索引到 batch_idx。"""
+        while len(self.long_image_memory) <= batch_idx:
+            self.long_image_memory.append([])
 
-    def _merge_long_memory(self):
-        """Merge adjacent long-term memories until the list length
-        falls below or equals ``long_len``.
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def update_image_memory(self, batch_idx: int, image_features: jnp.ndarray):
+        """向第 ``batch_idx`` 个样本的长期记忆追加一帧视觉特征。"""
+        self._ensure_batch(batch_idx)
+        self.long_image_memory[batch_idx].append(image_features)
+        self._merge_long_memory(batch_idx)
 
-        The heuristic merges the pair of *adjacent* image feature
-        vectors with the highest cosine-like similarity (dot product
-        over flattened features). The merged vector is their simple
-        arithmetic mean. The process repeats until the desired length
-        is reached or no further pairs can be merged.
-        """
-        while len(self.long_image_memory) > self.merge_len:
+    def _merge_long_memory(self, batch_idx: int):
+        """对指定 batch 的长期记忆做相邻帧合并，直至长度 ≤ ``merge_len``。"""
+        mem_list = self.long_image_memory[batch_idx]
+        while len(mem_list) > self.merge_len:
             max_sim = None
             max_idx = None
-            # Search for the most similar adjacent pair.
-            for i in range(len(self.long_image_memory) - 1):
-                a = self.long_image_memory[i]
-                b = self.long_image_memory[i + 1]
+            for i in range(len(mem_list) - 1):
+                a = mem_list[i]
+                b = mem_list[i + 1]
                 sim = jnp.mean(jnp.dot(a.flatten(), b.flatten()))
                 if (max_sim is None) or (sim > max_sim):
                     max_sim = sim
                     max_idx = i
-            # If a pair is found, merge them; otherwise break.
             if max_idx is not None:
-                merged = (
-                    self.long_image_memory[max_idx]
-                    + self.long_image_memory[max_idx + 1]
-                ) / 2
-                # Replace first item with merged result and delete second.
-                self.long_image_memory[max_idx] = merged
-                del self.long_image_memory[max_idx + 1]
+                merged = (mem_list[max_idx] + mem_list[max_idx + 1]) / 2
+                mem_list[max_idx] = merged
+                del mem_list[max_idx + 1]
             else:
                 break
+        # 写回（必要时）
+        self.long_image_memory[batch_idx] = mem_list
+
+    def get_batched_memory(self, batch_size: int, feature_dim: int) -> jnp.ndarray:
+        """返回 shape = (batch_size, N, feature_dim) 的批量记忆。
+
+        N 为该批次中 *最大* 记忆长度；不足者用 0 补齐。"""
+        batched = []
+        max_len = 0
+        for b in range(batch_size):
+            if b < len(self.long_image_memory):
+                mem_list = self.long_image_memory[b]
+                if mem_list:
+                    arr = jnp.stack(mem_list, axis=0)  # (n_b, D)
+                else:
+                    arr = jnp.zeros((0, feature_dim))
+            else:
+                arr = jnp.zeros((0, feature_dim))
+            batched.append(arr)
+            max_len = max(max_len, arr.shape[0])
+
+        # pad 到统一长度
+        padded = []
+        for arr in batched:
+            if arr.shape[0] < max_len:
+                pad = jnp.zeros((max_len - arr.shape[0], feature_dim), dtype=arr.dtype)
+                arr = jnp.concatenate([arr, pad], axis=0)
+            padded.append(arr)
+
+        return jnp.stack(padded, axis=0)  # (B, N, D)
 
     def update_state_memory(self, state: jnp.ndarray):
         """Deprecated: kept for API compatibility.
@@ -74,9 +109,8 @@ class OpenPIMemory:
         """Return the current state only (history no longer stored)."""
         return current_state
 
-    def reset(self):
+    def reset(self):  # noqa: D401
         self.long_image_memory.clear()
-        # Only image memory needs resetting now.
         self._dummy_state_memory.clear()
 
     # ---------------------------------------------------------------------

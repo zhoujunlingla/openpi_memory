@@ -265,50 +265,37 @@ class Pi0(_model.BaseModel):
             ar_mask_img = ar_mask_list                                 # [s_img]
             # 只拼接长期记忆的视觉特征
             if self.use_memory and self.memory is not None:
-                mem_tokens = self.memory.long_image_memory
-                if len(mem_tokens) > 0:
-                    # ------------------------------------------------------
-                    # 1) 将长期记忆堆叠 & 广播到 batch: (B, N, D)
-                    # ------------------------------------------------------
-                    mem_stack = jnp.stack(mem_tokens, axis=0)  # (N, D)
-                    mem_stack = jnp.broadcast_to(
-                        mem_stack[None, ...],
-                        (image_tokens.shape[0],) + mem_stack.shape,
-                    )  # (B, N, D)
+                # ------------------------------------------------------
+                # 1) 取出批量长期记忆 (B, N, D)
+                # ------------------------------------------------------
+                mem_stack = self.memory.get_batched_memory(
+                    image_tokens.shape[0], image_tokens.shape[2]
+                )  # (B, N, D)
 
-                    # ------------------------------------------------------
+                if mem_stack.shape[1] > 0:
                     # 2) pad / truncate 到固定帧数 self.max_frames
-                    # ------------------------------------------------------
-                    n_cur = mem_stack.shape[1]
-                    if n_cur < self.max_frames:
-                        pad_len = self.max_frames - n_cur
+                    if mem_stack.shape[1] < self.max_frames:
+                        pad_len = self.max_frames - mem_stack.shape[1]
                         pad = jnp.zeros(
                             (mem_stack.shape[0], pad_len, mem_stack.shape[2]),
                             dtype=mem_stack.dtype,
                         )
                         mem_stack = jnp.concatenate([mem_stack, pad], axis=1)
-                    elif n_cur > self.max_frames:
+                    elif mem_stack.shape[1] > self.max_frames:
                         mem_stack = mem_stack[:, : self.max_frames, :]
 
-                    # ------------------------------------------------------
                     # 3) Feature‐wise MLP (先投影 D)
-                    # ------------------------------------------------------
                     mem_stack = self.mem_mlp_out(
                         nnx.swish(self.mem_mlp_in(mem_stack))
                     )  # (B, N, D)
 
-                    # ------------------------------------------------------
                     # 4) Token-dimension MLP: (B, N, D) → (B, 32, D)
-                    # ------------------------------------------------------
-                    # 转为 (B*D, N)
-                    b, n_tok, d_feat = mem_stack.shape
-                    mem_flat = mem_stack.transpose(0, 2, 1).reshape(-1, n_tok)  # (B*D, N)
-
-                    mem_flat = nnx.swish(self.len_mlp_in(mem_flat))             # (B*D, 4N)
-                    mem_flat = self.len_mlp_out(mem_flat)                       # (B*D, 32)
-
-                    mem_seq = mem_flat.reshape(b, d_feat, self.num_memory_tokens)
-                    q_tokens = mem_seq.transpose(0, 2, 1)                       # (B, 32, D)
+                    bsz, n_tok, d_feat = mem_stack.shape
+                    mem_flat = mem_stack.transpose(0, 2, 1).reshape(-1, n_tok)
+                    mem_flat = nnx.swish(self.len_mlp_in(mem_flat))
+                    mem_flat = self.len_mlp_out(mem_flat)  # (B*D, 32)
+                    mem_seq = mem_flat.reshape(bsz, d_feat, self.num_memory_tokens)
+                    q_tokens = mem_seq.transpose(0, 2, 1)
                 else:
                     q_tokens = jnp.zeros(
                         (
@@ -474,9 +461,9 @@ class Pi0(_model.BaseModel):
                 img_tokens, _ = self.PaliGemma.img(observation.images[name], train=False)
                 image_tokens_list.append(img_tokens)
             if image_tokens_list:
-                # Store memory per sample (take first batch element to avoid B mismatch)
-                sample_tokens = jnp.concatenate(image_tokens_list, axis=1)[0]  # shape (s_img_total, D)
-                self.memory.update_image_memory(sample_tokens)
+                all_tokens = jnp.concatenate(image_tokens_list, axis=1)  # (B, s_img_total, D)
+                for b in range(int(all_tokens.shape[0])):
+                    self.memory.update_image_memory(b, all_tokens[b])
 
         return loss_vals
 
@@ -562,8 +549,9 @@ class Pi0(_model.BaseModel):
                 )
                 image_tokens_list.append(img_tokens)
             if image_tokens_list:
-                all_image_tokens = jnp.concatenate(image_tokens_list, axis=1)
-                self.memory.update_image_memory(all_image_tokens)
+                all_image_tokens = jnp.concatenate(image_tokens_list, axis=1)  # (B, s_img_total, D)
+                for b in range(int(all_image_tokens.shape[0])):
+                    self.memory.update_image_memory(b, all_image_tokens[b])
 
         return x_0
 
