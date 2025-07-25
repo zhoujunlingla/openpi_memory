@@ -305,19 +305,49 @@ class Pi0(_model.BaseModel):
                         ),
                         dtype=image_tokens.dtype,
                     )
+                # Replace original token concatenation with [his]/[cur] markers
+                # --------------------------------------------------------------
+                # Insert special history ([his]) & current ([cur]) tokens
+                # --------------------------------------------------------------
+                bsz, _, d_feat = image_tokens.shape
+                his_tok = jnp.full((bsz, 1, d_feat), -1.0, dtype=image_tokens.dtype)
+                cur_tok = jnp.full((bsz, 1, d_feat), 1.0, dtype=image_tokens.dtype)
+
+                tokens.append(his_tok)
                 tokens.append(q_tokens)
+                tokens.append(cur_tok)
                 tokens.append(image_tokens)
+
                 # masks
+                his_mask = jnp.ones((bsz, 1), dtype=jnp.bool_)
                 q_mask = jnp.ones((q_tokens.shape[0], q_tokens.shape[1]), dtype=jnp.bool_)
+                cur_mask = jnp.ones((bsz, 1), dtype=jnp.bool_)
+                input_mask.append(his_mask)
                 input_mask.append(q_mask)
+                input_mask.append(cur_mask)
                 input_mask.append(image_mask)
-                # ar_mask: treat summary tokens like previous memory (non-auto-regressive)
+
+                # ar_mask: non-autoregressive for [his], memory, [cur]
+                ar_mask += [False]                 # [his]
                 ar_mask += [False] * q_tokens.shape[1]
+                ar_mask += [False]                 # [cur]
                 ar_mask += ar_mask_img
+                # end memory branch modifications
             else:
+                # Insert [cur] token before current frame tokens when no long-term memory is used
+                bsz, _, d_feat = image_tokens.shape
+                cur_tok = jnp.full((bsz, 1, d_feat), 1.0, dtype=image_tokens.dtype)
+
+                tokens.append(cur_tok)
                 tokens.append(image_tokens)
+
+                cur_mask = jnp.ones((bsz, 1), dtype=jnp.bool_)
+                input_mask.append(cur_mask)
                 input_mask.append(image_mask)
+
+                ar_mask += [False]                 # [cur]
                 ar_mask += ar_mask_img
+                # end no-memory branch modifications
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
