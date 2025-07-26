@@ -208,9 +208,17 @@ class Pi0(_model.BaseModel):
                                       paligemma_config.width,
                                       rngs=rngs)
 
-        # Token-dimension compression: (N → 4N → 32)
-        self.len_mlp_in = nnx.Linear(self.max_frames, self.max_frames * 4, rngs=rngs)
-        self.len_mlp_out = nnx.Linear(self.max_frames * 4, self.num_memory_tokens, rngs=rngs)
+        # Token-dimension MLP for compressing long-term memory to 32 visual tokens
+        # First compression: current frame -> 32 visual tokens before storing in long-term memory
+        # These layers operate on the token axis (N) to compress (B, N, D) -> (B, 32, D)
+        self.first_compression_in = nnx.Linear(self.max_frames, 64, rngs=rngs)
+        self.first_compression_out = nnx.Linear(64, self.num_memory_tokens, rngs=rngs)
+        
+        # Second compression: long-term memory -> 256 visual tokens before input to VLM
+        # These layers operate on the token axis (N) to compress (B, N, D) -> (B, 256, D)
+        self.second_compression_in = nnx.Linear(self.max_frames, 128, rngs=rngs)
+        self.second_compression_out = nnx.Linear(128, 256, rngs=rngs)
+       
         self.state_proj = nnx.Linear(
             config.action_dim, action_expert_config.width, rngs=rngs
         )
@@ -234,6 +242,56 @@ class Pi0(_model.BaseModel):
             state_len=config.long_memory_length,
         )
         self.use_memory = True
+
+    def compress_current_frame(self, image_tokens: jnp.ndarray) -> jnp.ndarray:
+        """第一次压缩：将当前帧的SigLIP token压缩成32个视觉token，用于存储到长期记忆中。
+        
+        Args:
+            image_tokens: (B, N, D) 当前帧的SigLIP编码token
+            
+        Returns:
+            compressed_tokens: (B, 32, D) 压缩后的32个视觉token
+        """
+        bsz, n_tok, d_feat = image_tokens.shape
+        
+        # 1) Feature-wise MLP (先投影 D 维)
+        projected = self.mem_mlp_out(
+            nnx.swish(self.mem_mlp_in(image_tokens))
+        )  # (B, N, D)
+        
+        # 2) Token-dimension MLP: (B, N, D) → (B, 32, D)
+        mem_flat = projected.transpose(0, 2, 1).reshape(-1, n_tok)  # (B*D, N)
+        mem_flat = nnx.swish(self.first_compression_in(mem_flat))  # (B*D, 64)
+        mem_flat = self.first_compression_out(mem_flat)  # (B*D, 32)
+        mem_seq = mem_flat.reshape(bsz, d_feat, self.num_memory_tokens)  # (B, D, 32)
+        compressed_tokens = mem_seq.transpose(0, 2, 1)  # (B, 32, D)
+        
+        return compressed_tokens
+
+    def compress_long_term_memory(self, mem_stack: jnp.ndarray) -> jnp.ndarray:
+        """第二次压缩：将长期记忆压缩成256个视觉token，用于输入到VLM。
+        
+        Args:
+            mem_stack: (B, N, D) 长期记忆中的token
+            
+        Returns:
+            compressed_tokens: (B, 256, D) 压缩后的256个视觉token
+        """
+        bsz, n_tok, d_feat = mem_stack.shape
+        
+        # 1) Feature-wise MLP (先投影 D 维)
+        projected = self.mem_mlp_out(
+            nnx.swish(self.mem_mlp_in(mem_stack))
+        )  # (B, N, D)
+        
+        # 2) Token-dimension MLP: (B, N, D) → (B, 256, D)
+        mem_flat = projected.transpose(0, 2, 1).reshape(-1, n_tok)  # (B*D, N)
+        mem_flat = nnx.swish(self.second_compression_in(mem_flat))  # (B*D, 128)
+        mem_flat = self.second_compression_out(mem_flat)  # (B*D, 256)
+        mem_seq = mem_flat.reshape(bsz, d_feat, 256)  # (B, D, 256)
+        compressed_tokens = mem_seq.transpose(0, 2, 1)  # (B, 256, D)
+        
+        return compressed_tokens
 
     @at.typecheck
     def embed_prefix(
@@ -284,23 +342,13 @@ class Pi0(_model.BaseModel):
                     elif mem_stack.shape[1] > self.max_frames:
                         mem_stack = mem_stack[:, : self.max_frames, :]
 
-                    # 3) Feature‐wise MLP (先投影 D)
-                    mem_stack = self.mem_mlp_out(
-                        nnx.swish(self.mem_mlp_in(mem_stack))
-                    )  # (B, N, D)
-
-                    # 4) Token-dimension MLP: (B, N, D) → (B, 32, D)
-                    bsz, n_tok, d_feat = mem_stack.shape
-                    mem_flat = mem_stack.transpose(0, 2, 1).reshape(-1, n_tok)
-                    mem_flat = nnx.swish(self.len_mlp_in(mem_flat))
-                    mem_flat = self.len_mlp_out(mem_flat)  # (B*D, 32)
-                    mem_seq = mem_flat.reshape(bsz, d_feat, self.num_memory_tokens)
-                    q_tokens = mem_seq.transpose(0, 2, 1)
+                    # 第二次压缩：长期记忆 -> 256个视觉token
+                    q_tokens = self.compress_long_term_memory(mem_stack)
                 else:
                     q_tokens = jnp.zeros(
                         (
                             image_tokens.shape[0],
-                            self.num_memory_tokens,
+                            256,  # 第二次压缩后的token数量
                             image_tokens.shape[2],
                         ),
                         dtype=image_tokens.dtype,
@@ -492,8 +540,10 @@ class Pi0(_model.BaseModel):
                 image_tokens_list.append(img_tokens)
             if image_tokens_list:
                 all_tokens = jnp.concatenate(image_tokens_list, axis=1)  # (B, s_img_total, D)
-                for b in range(int(all_tokens.shape[0])):
-                    self.memory.update_image_memory(b, all_tokens[b])
+                # 第一次压缩：当前帧 -> 32个视觉token
+                compressed_tokens = self.compress_current_frame(all_tokens)
+                for b in range(int(compressed_tokens.shape[0])):
+                    self.memory.update_image_memory(b, compressed_tokens[b])
 
         return loss_vals
 
@@ -580,8 +630,10 @@ class Pi0(_model.BaseModel):
                 image_tokens_list.append(img_tokens)
             if image_tokens_list:
                 all_image_tokens = jnp.concatenate(image_tokens_list, axis=1)  # (B, s_img_total, D)
-                for b in range(int(all_image_tokens.shape[0])):
-                    self.memory.update_image_memory(b, all_image_tokens[b])
+                # 第一次压缩：当前帧 -> 32个视觉token
+                compressed_tokens = self.compress_current_frame(all_image_tokens)
+                for b in range(int(compressed_tokens.shape[0])):
+                    self.memory.update_image_memory(b, compressed_tokens[b])
 
         return x_0
 
