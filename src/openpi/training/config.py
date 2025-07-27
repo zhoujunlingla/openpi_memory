@@ -692,7 +692,7 @@ _CONFIGS = [
         name="pi0_backup",
         model=pi0.Pi0Config(action_horizon=50, max_token_len=180),
         data=LeRobotPiperDataConfig(
-            repo_id="csuvla/task1",
+            repo_id="csuvla/multi_task",
             repack_transforms=_transforms.Group(
                 inputs=[
                     _transforms.RepackTransform(
@@ -714,7 +714,7 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/mnt/afs/intern/fangwenhan/zhoujunl/openpi/checkpoints/pi0_piper/task1-16/29999/params"
+            "s3://openpi-assets/checkpoints/pi0_base/params"
         ),
         num_train_steps=30_000,
         batch_size=32,

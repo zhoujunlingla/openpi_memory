@@ -211,12 +211,23 @@ class Pi0(_model.BaseModel):
         # Token-dimension MLP for compressing long-term memory to 32 visual tokens
         # First compression: current frame -> 32 visual tokens before storing in long-term memory
         # These layers operate on the token axis (N) to compress (B, N, D) -> (B, 32, D)
-        self.first_compression_in = nnx.Linear(self.max_frames, 64, rngs=rngs)
+        # 先运行一次SigLIP来获取实际的token数量（包括所有摄像头）
+        fake_obs = config.fake_obs()
+        fake_image_tokens_list = []
+        for name in fake_obs.images:
+            fake_tokens, _ = self.PaliGemma.img(fake_obs.images[name], train=False)
+            fake_image_tokens_list.append(fake_tokens)
+        # 模拟compute_loss中的concatenate操作
+        fake_all_tokens = jnp.concatenate(fake_image_tokens_list, axis=1)
+        siglip_token_count = fake_all_tokens.shape[1]  # 获取实际的token数量（所有摄像头）
+        
+        self.first_compression_in = nnx.Linear(siglip_token_count, 64, rngs=rngs)
         self.first_compression_out = nnx.Linear(64, self.num_memory_tokens, rngs=rngs)
         
         # Second compression: long-term memory -> 256 visual tokens before input to VLM
         # These layers operate on the token axis (N) to compress (B, N, D) -> (B, 256, D)
-        self.second_compression_in = nnx.Linear(self.max_frames, 128, rngs=rngs)
+        # N = max_frames * num_memory_tokens
+        self.second_compression_in = nnx.Linear(self.max_frames * self.num_memory_tokens, 128, rngs=rngs)
         self.second_compression_out = nnx.Linear(128, 256, rngs=rngs)
        
         self.state_proj = nnx.Linear(
@@ -269,15 +280,16 @@ class Pi0(_model.BaseModel):
         return compressed_tokens
 
     def compress_long_term_memory(self, mem_stack: jnp.ndarray) -> jnp.ndarray:
-        """第二次压缩：将长期记忆压缩成256个视觉token，用于输入到VLM。
+        """第二次压缩：将长期记忆中的token压缩成256个视觉token，用于输入到VLM。
         
         Args:
-            mem_stack: (B, N, D) 长期记忆中的token
+            mem_stack: (B, N, D) 长期记忆中的N个token（max_frames个记录 × num_memory_tokens个token）
             
         Returns:
             compressed_tokens: (B, 256, D) 压缩后的256个视觉token
         """
         bsz, n_tok, d_feat = mem_stack.shape
+        
         
         # 1) Feature-wise MLP (先投影 D 维)
         projected = self.mem_mlp_out(
@@ -285,17 +297,19 @@ class Pi0(_model.BaseModel):
         )  # (B, N, D)
         
         # 2) Token-dimension MLP: (B, N, D) → (B, 256, D)
+        # 将N个token压缩成256个token
         mem_flat = projected.transpose(0, 2, 1).reshape(-1, n_tok)  # (B*D, N)
         mem_flat = nnx.swish(self.second_compression_in(mem_flat))  # (B*D, 128)
         mem_flat = self.second_compression_out(mem_flat)  # (B*D, 256)
         mem_seq = mem_flat.reshape(bsz, d_feat, 256)  # (B, D, 256)
         compressed_tokens = mem_seq.transpose(0, 2, 1)  # (B, 256, D)
         
+        
         return compressed_tokens
 
     @at.typecheck
     def embed_prefix(
-        self, obs: _model.Observation
+        self, obs: _model.Observation, timestep: at.Float[at.Array, " b"] = None
     ) -> tuple[
         at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]
     ]:
@@ -328,22 +342,38 @@ class Pi0(_model.BaseModel):
                 # ------------------------------------------------------
                 mem_stack = self.memory.get_batched_memory(
                     image_tokens.shape[0], image_tokens.shape[2]
-                )  # (B, N, D)
+                )  # (B, N, 32, D) 其中N是记录数量，每个记录是32个token
 
                 if mem_stack.shape[1] > 0:
-                    # 2) pad / truncate 到固定帧数 self.max_frames
-                    if mem_stack.shape[1] < self.max_frames:
-                        pad_len = self.max_frames - mem_stack.shape[1]
+                    # 2) 处理长期记忆：每条记录是32个token的压缩结果
+                    # mem_stack shape: (B, N, 32, D) 其中N是记录数量，每个记录是32个token
+                    bsz, n_records, n_tokens_per_record, d_feat = mem_stack.shape
+                    
+                    # 我们需要将N个记录（每个记录是32个token）重新组织
+                    # 目标：收集到 max_frames 个记录，每个记录是 num_memory_tokens 个token
+                    
+                    # 如果记录数量不足max_frames，用零填充
+                    target_records = self.max_frames
+                    if n_records < target_records:
+                        pad_len = target_records - n_records
                         pad = jnp.zeros(
-                            (mem_stack.shape[0], pad_len, mem_stack.shape[2]),
+                            (bsz, pad_len, n_tokens_per_record, d_feat),
                             dtype=mem_stack.dtype,
                         )
                         mem_stack = jnp.concatenate([mem_stack, pad], axis=1)
-                    elif mem_stack.shape[1] > self.max_frames:
-                        mem_stack = mem_stack[:, : self.max_frames, :]
-
-                    # 第二次压缩：长期记忆 -> 256个视觉token
-                    q_tokens = self.compress_long_term_memory(mem_stack)
+                    elif n_records > target_records:
+                        mem_stack = mem_stack[:, :target_records, :, :]
+                    
+                    # 现在 mem_stack shape: (B, max_frames, num_memory_tokens, D) 
+                    # 我们需要将这max_frames个记录（每个记录num_memory_tokens个token）重新组织成适合第二次压缩的形状
+                    # 将 (B, max_frames, num_memory_tokens, D) 重新组织成 (B, max_frames*num_memory_tokens, D)
+                    bsz, n_records, n_tokens_per_record, d_feat = mem_stack.shape
+                    mem_stack_reshaped = mem_stack.reshape(bsz, n_records * n_tokens_per_record, d_feat)
+                    
+                    
+                    
+                    q_tokens = self.compress_long_term_memory(mem_stack_reshaped)
+                    
                 else:
                     q_tokens = jnp.zeros(
                         (
@@ -353,48 +383,60 @@ class Pi0(_model.BaseModel):
                         ),
                         dtype=image_tokens.dtype,
                     )
-                # Replace original token concatenation with [his]/[cur] markers
-                # --------------------------------------------------------------
-                # Insert special history ([his]) & current ([cur]) tokens
+                # 新的token拼接逻辑：时间戳token + 长期记忆256个token + 当前帧token
                 # --------------------------------------------------------------
                 bsz, _, d_feat = image_tokens.shape
-                his_tok = jnp.full((bsz, 1, d_feat), -1.0, dtype=image_tokens.dtype)
-                cur_tok = jnp.full((bsz, 1, d_feat), 1.0, dtype=image_tokens.dtype)
-
-                tokens.append(his_tok)
+                
+                # 1. 添加时间戳token（使用sin-cos编码）
+                if timestep is not None:
+                    # 使用与embed_suffix相同的时间编码方式
+                    time_emb = posemb_sincos(
+                        timestep, d_feat, min_period=4e-3, max_period=4.0
+                    )
+                    time_token = time_emb[:, None, :]  # (B, 1, D)
+                else:
+                    # 如果没有提供时间戳，使用零向量
+                    time_token = jnp.zeros((bsz, 1, d_feat), dtype=image_tokens.dtype)
+                
+                # 2. 拼接token：时间戳 + 长期记忆 + 当前帧
+                tokens.append(time_token)
                 tokens.append(q_tokens)
-                tokens.append(cur_tok)
                 tokens.append(image_tokens)
 
-                # masks
-                his_mask = jnp.ones((bsz, 1), dtype=jnp.bool_)
+                # 3. 对应的masks
+                time_mask = jnp.ones((bsz, 1), dtype=jnp.bool_)
                 q_mask = jnp.ones((q_tokens.shape[0], q_tokens.shape[1]), dtype=jnp.bool_)
-                cur_mask = jnp.ones((bsz, 1), dtype=jnp.bool_)
-                input_mask.append(his_mask)
+                input_mask.append(time_mask)
                 input_mask.append(q_mask)
-                input_mask.append(cur_mask)
                 input_mask.append(image_mask)
 
-                # ar_mask: non-autoregressive for [his], memory, [cur]
-                ar_mask += [False]                 # [his]
-                ar_mask += [False] * q_tokens.shape[1]
-                ar_mask += [False]                 # [cur]
-                ar_mask += ar_mask_img
+                # 4. ar_mask: 时间戳和长期记忆都是non-autoregressive
+                ar_mask += [False]                 # 时间戳token
+                ar_mask += [False] * q_tokens.shape[1]  # 长期记忆token
+                ar_mask += ar_mask_img  # 当前帧token
                 # end memory branch modifications
             else:
-                # Insert [cur] token before current frame tokens when no long-term memory is used
+                # 没有长期记忆时：时间戳token + 当前帧token
                 bsz, _, d_feat = image_tokens.shape
-                cur_tok = jnp.full((bsz, 1, d_feat), 1.0, dtype=image_tokens.dtype)
+                
+                # 1. 添加时间戳token
+                if timestep is not None:
+                    time_emb = posemb_sincos(
+                        timestep, d_feat, min_period=4e-3, max_period=4.0
+                    )
+                    time_token = time_emb[:, None, :]  # (B, 1, D)
+                else:
+                    time_token = jnp.zeros((bsz, 1, d_feat), dtype=image_tokens.dtype)
 
-                tokens.append(cur_tok)
+                tokens.append(time_token)
                 tokens.append(image_tokens)
 
-                cur_mask = jnp.ones((bsz, 1), dtype=jnp.bool_)
-                input_mask.append(cur_mask)
+                time_mask = jnp.ones((bsz, 1), dtype=jnp.bool_)
+                input_mask.append(time_mask)
                 input_mask.append(image_mask)
 
-                ar_mask += [False]                 # [cur]
-                ar_mask += ar_mask_img
+                ar_mask += [False]                 # 时间戳token
+                ar_mask += ar_mask_img  # 当前帧token
                 # end no-memory branch modifications
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
@@ -463,6 +505,25 @@ class Pi0(_model.BaseModel):
             preprocess_rng, observation, train=train
         )
 
+        # 训练时每个batch开始时重置长期记忆，确保每个batch独立
+        if self.use_memory and train:
+            self.memory.reset()
+
+        # 训练时进行两次MLP压缩：
+        # 1. 第一次压缩：当前帧 -> 32个视觉token -> 存储到长期记忆
+        # 2. 第二次压缩：长期记忆 -> 256个视觉token -> 用于VLM输入
+        if self.use_memory and train:
+            image_tokens_list = []
+            for name in observation.images:
+                img_tokens, _ = self.PaliGemma.img(observation.images[name], train=False)
+                image_tokens_list.append(img_tokens)
+            if image_tokens_list:
+                all_tokens = jnp.concatenate(image_tokens_list, axis=1)  # (B, s_img_total, D)
+                # 第一次压缩：当前帧 -> 32个视觉token
+                compressed_tokens = self.compress_current_frame(all_tokens)
+                for b in range(int(compressed_tokens.shape[0])):
+                    self.memory.update_image_memory(b, compressed_tokens[b])
+
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
@@ -470,8 +531,9 @@ class Pi0(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        # 前向传播：embed_prefix会自动进行第二次压缩（长期记忆 -> 256个视觉token）
+        # 传入时间参数给embed_prefix
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, time)
         suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(
             observation, x_t, time
         )
@@ -529,22 +591,6 @@ class Pi0(_model.BaseModel):
 
         loss_vals = jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
-        # ------------------------------------------------------------------
-        # Update visual memory during training so that short/long memories are
-        # non-empty and attention metrics become meaningful.
-        # ------------------------------------------------------------------
-        if self.use_memory and train:
-            image_tokens_list = []
-            for name in observation.images:
-                img_tokens, _ = self.PaliGemma.img(observation.images[name], train=False)
-                image_tokens_list.append(img_tokens)
-            if image_tokens_list:
-                all_tokens = jnp.concatenate(image_tokens_list, axis=1)  # (B, s_img_total, D)
-                # 第一次压缩：当前帧 -> 32个视觉token
-                compressed_tokens = self.compress_current_frame(all_tokens)
-                for b in range(int(compressed_tokens.shape[0])):
-                    self.memory.update_image_memory(b, compressed_tokens[b])
-
         return loss_vals
 
     @override
@@ -565,7 +611,8 @@ class Pi0(_model.BaseModel):
         )
 
         # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        # 在推理时，使用时间1.0（对应噪声状态）
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, jnp.ones(batch_size))
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm(
@@ -621,6 +668,7 @@ class Pi0(_model.BaseModel):
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
 
         # 在推理完成后，更新长期视觉记忆，以便下一次推理使用。
+        # 推理时保持长期记忆的连续性，不重置记忆
         if self.use_memory:
             image_tokens_list = []
             for name in observation.images:
@@ -662,7 +710,7 @@ class Pi0(_model.BaseModel):
         """
 
         # 1. Prefix pass (images, prompt, etc.) ---------------------------------
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, timestep)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1  # (b, p_len)
 

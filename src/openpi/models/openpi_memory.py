@@ -39,26 +39,31 @@ class OpenPIMemory:
         self._merge_long_memory(batch_idx)
 
     def _merge_long_memory(self, batch_idx: int):
-        """对指定 batch 的长期记忆做相邻帧合并，直至长度 ≤ ``merge_len``。"""
+        """对指定 batch 的长期记忆做相邻帧合并。
+        
+        当记忆长度超过 long_len 时触发合并，重复合并直到记忆长度 ≤ merge_len。
+        """
         mem_list = self.long_image_memory[batch_idx]
-        while len(mem_list) > self.merge_len:
-            max_sim = None
-            max_idx = None
-            for i in range(len(mem_list) - 1):
-                a = mem_list[i]
-                b = mem_list[i + 1]
-                sim = jnp.mean(jnp.dot(a.flatten(), b.flatten()))
-                if (max_sim is None) or (sim > max_sim):
-                    max_sim = sim
-                    max_idx = i
-            if max_idx is not None:
-                merged = (mem_list[max_idx] + mem_list[max_idx + 1]) / 2
-                mem_list[max_idx] = merged
-                del mem_list[max_idx + 1]
-            else:
-                break
-        # 写回（必要时）
-        self.long_image_memory[batch_idx] = mem_list
+        # 当记忆长度超过 long_len 时触发合并
+        if len(mem_list) > self.long_len:
+            while len(mem_list) > self.merge_len:
+                max_sim = None
+                max_idx = None
+                for i in range(len(mem_list) - 1):
+                    a = mem_list[i]
+                    b = mem_list[i + 1]
+                    sim = jnp.mean(jnp.dot(a.flatten(), b.flatten()))
+                    if (max_sim is None) or (sim > max_sim):
+                        max_sim = sim
+                        max_idx = i
+                if max_idx is not None:
+                    merged = (mem_list[max_idx] + mem_list[max_idx + 1]) / 2
+                    mem_list[max_idx] = merged
+                    del mem_list[max_idx + 1]
+                else:
+                    break
+            # 写回（必要时）
+            self.long_image_memory[batch_idx] = mem_list
 
     def get_batched_memory(self, batch_size: int, feature_dim: int) -> jnp.ndarray:
         """返回 shape = (batch_size, N, feature_dim) 的批量记忆。
@@ -97,9 +102,26 @@ class OpenPIMemory:
         pass
 
     def get_concat_image_features(
-        self, current_image_features: jnp.ndarray
+        self, batch_idx: int, current_image_features: jnp.ndarray
     ) -> jnp.ndarray:
-        all_features = self.long_image_memory + [current_image_features]
+        """获取指定批次的历史记忆与当前帧特征的拼接。
+        
+        Args:
+            batch_idx: 批次索引
+            current_image_features: 当前帧的图像特征
+            
+        Returns:
+            拼接后的特征数组
+        """
+        # 确保批次存在
+        self._ensure_batch(batch_idx)
+        
+        # 获取当前批次的历史记忆
+        batch_memory = self.long_image_memory[batch_idx]
+        
+        # 将历史记忆与当前帧特征拼接
+        all_features = batch_memory + [current_image_features]
+        
         if all_features:
             return jnp.concatenate(all_features, axis=0)
         else:
